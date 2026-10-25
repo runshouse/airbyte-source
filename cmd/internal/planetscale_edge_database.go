@@ -221,6 +221,7 @@ func (p PlanetScaleEdgeDatabase) Read(ctx context.Context, w io.Writer, ps Plane
 	}
 
 	table := s.Stream
+	requireCopyCompletion := s.SyncMode == SYNC_MODE_FULL_REFRESH
 	timeout := 5 * time.Minute
 	if timeoutSeconds := ps.TimeoutSeconds; timeoutSeconds != nil {
 		timeout = time.Duration(*timeoutSeconds) * time.Second
@@ -254,7 +255,7 @@ func (p PlanetScaleEdgeDatabase) Read(ctx context.Context, w io.Writer, ps Plane
 	for {
 		syncCount += 1
 		p.Logger.Log(LOGLEVEL_INFO, fmt.Sprintf("%sStarting sync #%v", preamble, syncCount))
-		newPosition, recordCount, err := p.sync(ctx, syncMode, currentPosition, stopPosition, table, ps, tabletType, timeout)
+		newPosition, recordCount, err := p.sync(ctx, syncMode, currentPosition, stopPosition, table, ps, tabletType, timeout, requireCopyCompletion)
 		totalRecordCount += recordCount
 		// sync may return a new cursor (e.g. after a LASTPK event), so checkpoint what it returned
 		currentPosition = newPosition
@@ -267,9 +268,9 @@ func (p PlanetScaleEdgeDatabase) Read(ctx context.Context, w io.Writer, ps Plane
 			if s, ok := status.FromError(err); ok {
 				p.Logger.Log(LOGLEVEL_INFO, fmt.Sprintf("%v%v records synced after %v syncs. Got error [%v], returning with cursor [%v] after gRPC error", preamble, totalRecordCount, syncCount, s.Code(), currentPosition))
 				if syncCount >= maxRetries {
-					// A deadline ends a bounded read; anything else means we could not read, e.g. the
-					// cursor is older than binlog retention. Fail instead of reporting a successful sync.
-					if s.Code() == codes.DeadlineExceeded {
+					// Explicit full refresh must complete COPY. Other modes keep bounded
+					// deadline success; all other exhausted errors must fail the sync.
+					if s.Code() == codes.DeadlineExceeded && !requireCopyCompletion {
 						return currentSerializedCursor, nil
 					}
 					return currentSerializedCursor, errors.Wrapf(err, "giving up after %v syncs", syncCount)
@@ -286,7 +287,7 @@ func (p PlanetScaleEdgeDatabase) Read(ctx context.Context, w io.Writer, ps Plane
 	}
 }
 
-func (p PlanetScaleEdgeDatabase) sync(ctx context.Context, syncMode string, tc *psdbconnect.TableCursor, stopPosition string, s Stream, ps PlanetScaleSource, tabletType psdbconnect.TabletType, timeout time.Duration) (_ *psdbconnect.TableCursor, _ int, err error) {
+func (p PlanetScaleEdgeDatabase) sync(ctx context.Context, syncMode string, tc *psdbconnect.TableCursor, stopPosition string, s Stream, ps PlanetScaleSource, tabletType psdbconnect.TabletType, timeout time.Duration, requireCopyCompletion bool) (_ *psdbconnect.TableCursor, _ int, err error) {
 	preamble := fmt.Sprintf("[%v:%v:%v shard : %v] ", s.Namespace, TabletTypeToString(tabletType), s.Name, tc.Shard)
 
 	// records that failed to write must not be checkpointed past
@@ -349,6 +350,9 @@ func (p PlanetScaleEdgeDatabase) sync(ctx context.Context, syncMode string, tc *
 				p.Logger.Log(LOGLEVEL_INFO, fmt.Sprintf("%sExiting sync and flushing records because no new VGTID found after last position or deadline exceeded %+v", preamble, tc))
 				return tc, resultCount, err
 			} else if errors.Is(err, io.EOF) {
+				if requireCopyCompletion && isFullSync && !copyCompletedSeen {
+					return tc, resultCount, errors.New("full refresh ended before COPY_COMPLETED")
+				}
 				// EOF is an acceptable error indicating VStream is finished.
 				p.Logger.Log(LOGLEVEL_INFO, fmt.Sprintf("%sExiting sync and flushing records because EOF encountered at position %+v", preamble, tc))
 				return tc, resultCount, io.EOF

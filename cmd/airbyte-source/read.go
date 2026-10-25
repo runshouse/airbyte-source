@@ -197,7 +197,11 @@ func readState(state string, psc internal.PlanetScaleSource, streams []internal.
 				logger.Log(internal.LOGLEVEL_INFO, fmt.Sprintf("Ignoring cursor for key %s because incremental sync not requested", stateKey))
 			}
 			logger.Log(internal.LOGLEVEL_INFO, fmt.Sprintf("Ignoring current cursor since incremental sync is disabled, or no cursor was found for key %s", stateKey))
-			initialState, err := psc.GetInitialState(keyspaceOrDatabase, shards)
+			initialSource := psc
+			if s.SyncMode == internal.SYNC_MODE_FULL_REFRESH {
+				initialSource.StartingGtids = ""
+			}
+			initialState, err := initialSource.GetInitialState(keyspaceOrDatabase, shards)
 			if err != nil {
 				return syncState, err
 			}
