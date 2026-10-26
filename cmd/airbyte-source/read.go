@@ -92,6 +92,8 @@ func ReadCommand(ch *Helper) *cobra.Command {
 				os.Exit(1)
 			}
 
+			ch.Logger.Log(internal.LOGLEVEL_INFO, fmt.Sprintf("Shard coverage: discovered=%q configured=%q", strings.Join(shards, ","), psc.Shards))
+
 			syncState, err := readState(state, psc, catalog.Streams, shards, ch.Logger)
 			if err != nil {
 				ch.Logger.Error(fmt.Sprintf("Unable to read state : %v", err))
