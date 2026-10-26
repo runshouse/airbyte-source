@@ -109,6 +109,7 @@ func (p PlanetScaleEdgeDatabase) getStreamForTable(ctx context.Context, psc Plan
 		return stream, errors.Wrapf(err, "Unable to get column names & types for table %v", tableName)
 	}
 	stream.Schema.Properties[CDCCursorField] = PropertyType{Type: []string{"number"}, AirbyteType: "integer"}
+	stream.Schema.Properties[CDCDeletedAtField] = PropertyType{Type: []string{"null", "string"}, CustomFormat: "date-time", AirbyteType: "timestamp_with_timezone"}
 
 	// need this otherwise Airbyte will fail schema discovery for views
 	// without primary keys.
@@ -198,7 +199,7 @@ func (p PlanetScaleEdgeDatabase) ListShards(ctx context.Context, psc PlanetScale
 // 2. This latest vgtid is now the stopping point for this sync session.
 // 3. Ask vstream to stream from the last known vgtid
 // 4. When we reach the stopping point, read all rows available at this vgtid
-// 5. End the stream when (a) a vgtid newer than latest vgtid is encountered or (b) the timeout kicks in.
+// 5. Complete only after COPY_COMPLETED or the target VGTID; exhausted timeouts fail.
 func (p PlanetScaleEdgeDatabase) Read(ctx context.Context, w io.Writer, ps PlanetScaleSource, s ConfiguredStream, lastKnownPosition *psdbconnect.TableCursor) (*SerializedCursor, error) {
 	var (
 		sErr                    error
@@ -221,7 +222,6 @@ func (p PlanetScaleEdgeDatabase) Read(ctx context.Context, w io.Writer, ps Plane
 	}
 
 	table := s.Stream
-	requireCopyCompletion := s.SyncMode == SYNC_MODE_FULL_REFRESH
 	timeout := 5 * time.Minute
 	if timeoutSeconds := ps.TimeoutSeconds; timeoutSeconds != nil {
 		timeout = time.Duration(*timeoutSeconds) * time.Second
@@ -255,7 +255,7 @@ func (p PlanetScaleEdgeDatabase) Read(ctx context.Context, w io.Writer, ps Plane
 	for {
 		syncCount += 1
 		p.Logger.Log(LOGLEVEL_INFO, fmt.Sprintf("%sStarting sync #%v", preamble, syncCount))
-		newPosition, recordCount, err := p.sync(ctx, syncMode, currentPosition, stopPosition, table, ps, tabletType, timeout, requireCopyCompletion)
+		newPosition, recordCount, err := p.sync(ctx, syncMode, currentPosition, stopPosition, table, ps, tabletType, timeout)
 		totalRecordCount += recordCount
 		// sync may return a new cursor (e.g. after a LASTPK event), so checkpoint what it returned
 		currentPosition = newPosition
@@ -268,11 +268,6 @@ func (p PlanetScaleEdgeDatabase) Read(ctx context.Context, w io.Writer, ps Plane
 			if s, ok := status.FromError(err); ok {
 				p.Logger.Log(LOGLEVEL_INFO, fmt.Sprintf("%v%v records synced after %v syncs. Got error [%v], returning with cursor [%v] after gRPC error", preamble, totalRecordCount, syncCount, s.Code(), currentPosition))
 				if syncCount >= maxRetries {
-					// Explicit full refresh must complete COPY. Other modes keep bounded
-					// deadline success; all other exhausted errors must fail the sync.
-					if s.Code() == codes.DeadlineExceeded && !requireCopyCompletion {
-						return currentSerializedCursor, nil
-					}
 					return currentSerializedCursor, errors.Wrapf(err, "giving up after %v syncs", syncCount)
 				}
 			} else if errors.Is(err, io.EOF) {
@@ -287,7 +282,7 @@ func (p PlanetScaleEdgeDatabase) Read(ctx context.Context, w io.Writer, ps Plane
 	}
 }
 
-func (p PlanetScaleEdgeDatabase) sync(ctx context.Context, syncMode string, tc *psdbconnect.TableCursor, stopPosition string, s Stream, ps PlanetScaleSource, tabletType psdbconnect.TabletType, timeout time.Duration, requireCopyCompletion bool) (_ *psdbconnect.TableCursor, _ int, err error) {
+func (p PlanetScaleEdgeDatabase) sync(ctx context.Context, syncMode string, tc *psdbconnect.TableCursor, stopPosition string, s Stream, ps PlanetScaleSource, tabletType psdbconnect.TabletType, timeout time.Duration) (_ *psdbconnect.TableCursor, _ int, err error) {
 	preamble := fmt.Sprintf("[%v:%v:%v shard : %v] ", s.Namespace, TabletTypeToString(tabletType), s.Name, tc.Shard)
 
 	// records that failed to write must not be checkpointed past
@@ -350,19 +345,20 @@ func (p PlanetScaleEdgeDatabase) sync(ctx context.Context, syncMode string, tc *
 				p.Logger.Log(LOGLEVEL_INFO, fmt.Sprintf("%sExiting sync and flushing records because no new VGTID found after last position or deadline exceeded %+v", preamble, tc))
 				return tc, resultCount, err
 			} else if errors.Is(err, io.EOF) {
-				if requireCopyCompletion && isFullSync && !copyCompletedSeen {
-					return tc, resultCount, errors.New("full refresh ended before COPY_COMPLETED")
+				if isFullSync {
+					return tc, resultCount, errors.New("VStream ended before COPY_COMPLETED")
 				}
-				// EOF is an acceptable error indicating VStream is finished.
-				p.Logger.Log(LOGLEVEL_INFO, fmt.Sprintf("%sExiting sync and flushing records because EOF encountered at position %+v", preamble, tc))
-				return tc, resultCount, io.EOF
+				return tc, resultCount, errors.New("VStream ended before target VGTID")
 			} else {
 				p.Logger.Log(LOGLEVEL_ERROR, fmt.Sprintf("%sExiting sync and flushing records due to error: %+v", preamble, err))
 				return tc, resultCount, err
 			}
 		}
 
-		var rows []*query.QueryResult
+		var rows []struct {
+			result    *sqltypes.Result
+			deletedAt *string
+		}
 		for _, event := range res.Events {
 			switch event.Type {
 			case binlogdata.VEventType_VGTID:
@@ -398,14 +394,37 @@ func (p PlanetScaleEdgeDatabase) sync(ctx context.Context, syncMode string, tc *
 				fields = event.FieldEvent.Fields
 				p.Logger.Log(LOGLEVEL_INFO, fmt.Sprintf("%sFIELD event found, setting fields to %+v", preamble, fields))
 			case binlogdata.VEventType_ROW:
-				// Collect rows for processing
 				for _, change := range event.RowEvent.RowChanges {
-					if change.After != nil {
-						rows = append(rows, &query.QueryResult{
-							Fields: fields,
-							Rows:   []*query.Row{change.After},
-						})
+					row := change.After
+					var deletedAt *string
+					if row == nil {
+						row = change.Before
+						if row == nil || event.Timestamp <= 0 || len(s.PrimaryKeys) == 0 {
+							return tc, resultCount, errors.New("delete requires a before-image, binlog timestamp and declared primary key")
+						}
+						value := time.Unix(event.Timestamp, 0).UTC().Format(time.RFC3339)
+						deletedAt = &value
 					}
+					result := sqltypes.Proto3ToResult(&query.QueryResult{Fields: fields, Rows: []*query.Row{row}})
+					if deletedAt != nil {
+						for _, key := range s.PrimaryKeys {
+							found := false
+							if len(key) == 1 {
+								for i, field := range result.Fields {
+									if field.Name == key[0] && i < len(result.Rows[0]) && !result.Rows[0][i].IsNull() {
+										found = true
+									}
+								}
+							}
+							if !found {
+								return tc, resultCount, errors.New("delete before-image is missing a supported non-null primary key")
+							}
+						}
+					}
+					rows = append(rows, struct {
+						result    *sqltypes.Result
+						deletedAt *string
+					}{result, deletedAt})
 				}
 			case binlogdata.VEventType_COPY_COMPLETED:
 				p.Logger.Log(LOGLEVEL_INFO, fmt.Sprintf("%sCOPY_COMPLETED event found, copy phase finished", preamble))
@@ -435,15 +454,15 @@ func (p PlanetScaleEdgeDatabase) sync(ctx context.Context, syncMode string, tc *
 
 		if len(rows) > 0 {
 			for _, result := range rows {
-				qr := sqltypes.Proto3ToResult(result)
+				qr := result.result
 				for _, row := range qr.Rows {
 					resultCount += 1
 					sqlResult := &sqltypes.Result{
-						Fields: fields,
+						Fields: qr.Fields,
 					}
 					sqlResult.Rows = append(sqlResult.Rows, row)
 					// Results queued to Airbyte here, and flushed at the end of sync()
-					p.printQueryResult(sqlResult, keyspaceOrDatabase, s.Name, &ps)
+					p.printQueryResult(sqlResult, keyspaceOrDatabase, s.Name, &ps, result.deletedAt)
 				}
 			}
 		}
@@ -537,11 +556,12 @@ func (p PlanetScaleEdgeDatabase) initializeVTGateClient(ctx context.Context, ps 
 
 // printQueryResult will pretty-print an AirbyteRecordMessage to the logger.
 // Copied from vtctl/query.go
-func (p PlanetScaleEdgeDatabase) printQueryResult(qr *sqltypes.Result, tableNamespace, tableName string, ps *PlanetScaleSource) {
+func (p PlanetScaleEdgeDatabase) printQueryResult(qr *sqltypes.Result, tableNamespace, tableName string, ps *PlanetScaleSource, deletedAt *string) {
 	data := QueryResultToRecords(qr, ps)
 
 	for _, record := range data {
 		record[CDCCursorField] = nextCDCCursor()
+		record[CDCDeletedAtField] = deletedAt
 		p.Logger.Record(tableNamespace, tableName, record)
 	}
 }
@@ -549,6 +569,7 @@ func (p PlanetScaleEdgeDatabase) printQueryResult(qr *sqltypes.Result, tableName
 // CDCCursorField orders versions of the same row for destination dedup, like Airbyte's own CDC sources:
 // https://docs.airbyte.com/platform/understanding-airbyte/cdc
 const CDCCursorField = "_ab_cdc_cursor"
+const CDCDeletedAtField = "_ab_cdc_deleted_at"
 
 var lastCDCCursor int64
 

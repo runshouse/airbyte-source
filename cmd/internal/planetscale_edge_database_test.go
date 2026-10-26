@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	psdbconnect "github.com/planetscale/airbyte-source/proto/psdbconnect/v1alpha1"
 	"github.com/stretchr/testify/assert"
@@ -2610,8 +2613,8 @@ func TestRead_FullSync_MaxRetries(t *testing.T) {
 	}
 
 	nextSyncStartCursor, err := ped.Read(context.Background(), os.Stdout, ps, cs, startCursor)
-	assert.NoError(t, err)
-	// Next sync will start at the VGTID where COPY COMPLETED is
+	assert.ErrorContains(t, err, "giving up after 3 syncs")
+	// An incomplete COPY retains its cursor but must not be reported complete.
 	esc, err := TableCursorToSerializedCursor(&psdbconnect.TableCursor{
 		Shard:    "-",
 		Keyspace: "connect-test",
@@ -2641,4 +2644,168 @@ func TestRead_FullSync_MaxRetries(t *testing.T) {
 	assert.Equal(t, strings.ReplaceAll(fmt.Sprintf("[connect-test:primary:customers shard : -] %v records synced after 3 syncs. Got error [DeadlineExceeded], returning with cursor [shard:\"-\"  keyspace:\"connect-test\"  position:\"MySQL56/e4e20f06-e28f-11ec-8d20-8e7ac09cb64c:1-10\"  last_known_pk:{fields:{name:\"id\"  type:INT64  charset:63  flags:53251}  rows:{lengths:4  values:\"30\"}}] after gRPC error", 30), " ", ""), strings.ReplaceAll(logLines[len(logLines)-1], " ", ""))
 	records := tal.records["connect-test.customers"]
 	assert.Equal(t, 30, len(records))
+}
+
+func TestRead_DeleteMetadataPreservesRowIdentityAndReinsert(t *testing.T) {
+	const start = "MySQL56/e4e20f06-e28f-11ec-8d20-8e7ac09cb64c:1-1"
+	const target = "MySQL56/e4e20f06-e28f-11ec-8d20-8e7ac09cb64c:1-2"
+	var output bytes.Buffer
+	fields := []*query.Field{
+		{Name: "id", Type: query.Type_INT64, ColumnType: "bigint"},
+		{Name: "product", Type: query.Type_VARCHAR, ColumnType: "varchar(32)"},
+		{Name: "deletedAt", Type: query.Type_DATETIME, ColumnType: "datetime"},
+	}
+	stream := &vtgateVStreamClientMock{vstreamResponses: []*vstreamResponse{{response: &vtgate.VStreamResponse{Events: []*binlogdata.VEvent{
+		{Type: binlogdata.VEventType_FIELD, FieldEvent: &binlogdata.FieldEvent{Fields: fields}},
+		{Type: binlogdata.VEventType_ROW, Timestamp: 1700000000, RowEvent: &binlogdata.RowEvent{RowChanges: []*binlogdata.RowChange{
+			{Before: &query.Row{Lengths: []int64{1, 3, -1}, Values: []byte("7old")}},
+			{After: &query.Row{Lengths: []int64{1, 3, -1}, Values: []byte("7new")}},
+			{Before: &query.Row{Lengths: []int64{1, 3, -1}, Values: []byte("7new")}, After: &query.Row{Lengths: []int64{1, 4, -1}, Values: []byte("7last")}},
+		}}},
+		{Type: binlogdata.VEventType_VGTID, Vgtid: &binlogdata.VGtid{ShardGtids: []*binlogdata.ShardGtid{{Shard: "-", Keyspace: "connect-test", Gtid: target}}}},
+	}}}}}
+	client := &vstreamClientMock{vstreamFn: func(_ context.Context, request *vtgate.VStreamRequest, _ ...grpc.CallOption) (vtgateservice.Vitess_VStreamClient, error) {
+		if request.Vgtid.ShardGtids[0].Gtid == "current" {
+			return &vtgateVStreamClientMock{vstreamResponses: []*vstreamResponse{{response: &vtgate.VStreamResponse{Events: []*binlogdata.VEvent{
+				{Type: binlogdata.VEventType_VGTID, Vgtid: &binlogdata.VGtid{ShardGtids: []*binlogdata.ShardGtid{{Shard: "-", Keyspace: "connect-test", Gtid: target}}}},
+			}}}}}, nil
+		}
+		return stream, nil
+	}}
+	source := PlanetScaleEdgeDatabase{Logger: NewLogger(&output), vtgateClientFn: func(context.Context, PlanetScaleSource) (vtgateservice.VitessClient, error) { return client, nil }}
+	configured := ConfiguredStream{Stream: Stream{Name: "customers", Namespace: "connect-test", PrimaryKeys: [][]string{{"id"}}}, SyncMode: "incremental"}
+	cursor, err := source.Read(context.Background(), os.Stdout, PlanetScaleSource{Database: "connect-test", MaxRetries: 1}, configured,
+		&psdbconnect.TableCursor{Shard: "-", Keyspace: "connect-test", Position: start})
+	if !assert.NoError(t, err) {
+		return
+	}
+	decoded, err := cursor.SerializedCursorToTableCursor(configured)
+	if assert.NoError(t, err) {
+		assert.Equal(t, target, decoded.Position)
+	}
+
+	var records []map[string]interface{}
+	for _, line := range bytes.Split(bytes.TrimSpace(output.Bytes()), []byte("\n")) {
+		decoder := json.NewDecoder(bytes.NewReader(line))
+		decoder.UseNumber()
+		var message AirbyteMessage
+		if !assert.NoError(t, decoder.Decode(&message)) {
+			return
+		}
+		if message.Type == RECORD {
+			records = append(records, message.Record.Data)
+		}
+	}
+	if !assert.Len(t, records, 3) {
+		return
+	}
+	assert.Equal(t, "2023-11-14T22:13:20Z", records[0][CDCDeletedAtField])
+	assert.Nil(t, records[1][CDCDeletedAtField])
+	assert.Nil(t, records[2][CDCDeletedAtField])
+	assert.Equal(t, []interface{}{"old", "new", "last"}, []interface{}{records[0]["product"], records[1]["product"], records[2]["product"]})
+	var previous int64
+	for _, record := range records {
+		assert.Equal(t, json.Number("7"), record["id"])
+		value, present := record["deletedAt"]
+		assert.True(t, present)
+		assert.Nil(t, value, "CDC metadata must not forge product.deletedAt")
+		sequence, ok := record[CDCCursorField].(json.Number)
+		if !assert.True(t, ok) {
+			return
+		}
+		current, err := sequence.Int64()
+		if !assert.NoError(t, err) {
+			return
+		}
+		assert.Greater(t, current, previous)
+		previous = current
+	}
+}
+
+func TestRead_DeleteRequiresBeforeImageTimestampAndKey(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		before    *query.Row
+		timestamp int64
+		keys      [][]string
+		field     string
+	}{
+		{"missing before-image", nil, 1700000000, [][]string{{"id"}}, "id"},
+		{"missing binlog timestamp", &query.Row{Lengths: []int64{1}, Values: []byte("7")}, 0, [][]string{{"id"}}, "id"},
+		{"missing declared key", &query.Row{Lengths: []int64{1}, Values: []byte("7")}, 1700000000, nil, "id"},
+		{"null key", &query.Row{Lengths: []int64{-1}}, 1700000000, [][]string{{"id"}}, "id"},
+		{"absent key column", &query.Row{Lengths: []int64{1}, Values: []byte("7")}, 1700000000, [][]string{{"id"}}, "other"},
+		{"unsupported nested key", &query.Row{Lengths: []int64{1}, Values: []byte("7")}, 1700000000, [][]string{{"id", "nested"}}, "id"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logger := &testAirbyteLogger{}
+			client := &vstreamClientMock{vstreamFn: func(context.Context, *vtgate.VStreamRequest, ...grpc.CallOption) (vtgateservice.Vitess_VStreamClient, error) {
+				return &vtgateVStreamClientMock{vstreamResponses: []*vstreamResponse{{response: &vtgate.VStreamResponse{Events: []*binlogdata.VEvent{
+					{Type: binlogdata.VEventType_FIELD, FieldEvent: &binlogdata.FieldEvent{Fields: []*query.Field{{Name: tc.field, Type: query.Type_INT64, ColumnType: "bigint"}}}},
+					{Type: binlogdata.VEventType_ROW, Timestamp: tc.timestamp, RowEvent: &binlogdata.RowEvent{RowChanges: []*binlogdata.RowChange{{Before: tc.before}}}},
+				}}}}}, nil
+			}}
+			source := PlanetScaleEdgeDatabase{Logger: logger, vtgateClientFn: func(context.Context, PlanetScaleSource) (vtgateservice.VitessClient, error) { return client, nil }}
+			_, _, err := source.sync(context.Background(), "incremental",
+				&psdbconnect.TableCursor{Shard: "-", Keyspace: "connect-test", Position: "MySQL56/e4e20f06-e28f-11ec-8d20-8e7ac09cb64c:1-1"},
+				"MySQL56/e4e20f06-e28f-11ec-8d20-8e7ac09cb64c:1-2",
+				Stream{Name: "customers", Namespace: "connect-test", PrimaryKeys: tc.keys}, PlanetScaleSource{Database: "connect-test"}, psdbconnect.TabletType_primary, time.Second)
+			assert.ErrorContains(t, err, "delete")
+			assert.Empty(t, logger.records)
+		})
+	}
+}
+
+func TestRead_CompletesOnlyAtCopyOrDeclaredTarget(t *testing.T) {
+	const start = "MySQL56/e4e20f06-e28f-11ec-8d20-8e7ac09cb64c:1-1"
+	const target = "MySQL56/e4e20f06-e28f-11ec-8d20-8e7ac09cb64c:1-3"
+	reached := &binlogdata.VEvent{Type: binlogdata.VEventType_VGTID, Vgtid: &binlogdata.VGtid{ShardGtids: []*binlogdata.ShardGtid{{Shard: "-", Keyspace: "connect-test", Gtid: target}}}}
+	for _, tc := range []struct {
+		name      string
+		copy      bool
+		resume    bool
+		events    []*binlogdata.VEvent
+		end       error
+		wantError string
+		readCalls int
+	}{
+		{"initial COPY EOF", true, false, nil, io.EOF, "before COPY_COMPLETED", 1},
+		{"initial COPY target without completion", true, false, []*binlogdata.VEvent{reached}, io.EOF, "before COPY_COMPLETED", 1},
+		{"resumed COPY EOF", true, true, nil, io.EOF, "before COPY_COMPLETED", 1},
+		{"COPY deadline exhaustion", true, false, nil, status.Error(codes.DeadlineExceeded, "deadline"), "giving up after 2 syncs", 2},
+		{"incremental EOF before target", false, false, nil, io.EOF, "before target VGTID", 1},
+		{"incremental deadline exhaustion", false, false, nil, status.Error(codes.DeadlineExceeded, "deadline"), "giving up after 2 syncs", 2},
+		{"incremental target reached", false, false, []*binlogdata.VEvent{reached}, io.EOF, "", 1},
+		{"COPY completed", true, false, []*binlogdata.VEvent{{Type: binlogdata.VEventType_COPY_COMPLETED}}, io.EOF, "", 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reads := 0
+			client := &vstreamClientMock{vstreamFn: func(_ context.Context, request *vtgate.VStreamRequest, _ ...grpc.CallOption) (vtgateservice.Vitess_VStreamClient, error) {
+				if request.Vgtid.ShardGtids[0].Gtid == "current" {
+					return &vtgateVStreamClientMock{vstreamResponses: []*vstreamResponse{{response: &vtgate.VStreamResponse{Events: []*binlogdata.VEvent{reached}}}}}, nil
+				}
+				reads++
+				return &vtgateVStreamClientMock{vstreamResponses: []*vstreamResponse{
+					{response: &vtgate.VStreamResponse{Events: tc.events}}, {err: tc.end},
+				}}, nil
+			}}
+			source := PlanetScaleEdgeDatabase{Logger: &testAirbyteLogger{}, vtgateClientFn: func(context.Context, PlanetScaleSource) (vtgateservice.VitessClient, error) { return client, nil }}
+			cursor := &psdbconnect.TableCursor{Shard: "-", Keyspace: "connect-test", Position: start}
+			if tc.copy {
+				cursor.Position = ""
+			}
+			if tc.resume {
+				cursor.Position = target
+				cursor.LastKnownPk = &query.QueryResult{Fields: []*query.Field{{Name: "id", Type: query.Type_INT64}}, Rows: []*query.Row{{Lengths: []int64{1}, Values: []byte("7")}}}
+			}
+			_, err := source.Read(context.Background(), os.Stdout, PlanetScaleSource{Database: "connect-test", MaxRetries: 2, UseGTIDWithTablePKs: true},
+				ConfiguredStream{Stream: Stream{Name: "customers", Namespace: "connect-test"}, SyncMode: "incremental"}, cursor)
+			if tc.wantError != "" {
+				assert.ErrorContains(t, err, tc.wantError)
+			} else {
+				assert.NoError(t, err)
+			}
+			assert.Equal(t, tc.readCalls, reads)
+		})
+	}
 }
