@@ -381,7 +381,6 @@ func (p PlanetScaleEdgeDatabase) sync(ctx context.Context, syncMode string, tc *
 						LastKnownPk: event.LastPKEvent.TableLastPK.Lastpk,
 						Position:    tc.Position,
 					}
-					p.Logger.Log(LOGLEVEL_INFO, fmt.Sprintf("%sLASTPK event found, setting last PK to %+v", preamble, tc))
 				}
 			case binlogdata.VEventType_FIELD:
 				// Save fields for processing
